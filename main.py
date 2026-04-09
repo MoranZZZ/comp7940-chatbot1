@@ -1,10 +1,10 @@
 import logging
 import os
 import datetime
+import requests
 import psycopg2
 from psycopg2 import sql
 from dotenv import load_dotenv
-from openai import OpenAI
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
@@ -22,7 +22,14 @@ logger = logging.getLogger(__name__)
 
 # 从环境变量获取密钥和配置
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+# HKBU GenAI API 配置
+HKBU_API_KEY = os.getenv("HKBU_API_KEY")
+HKBU_BASE_URL = os.getenv("HKBU_BASE_URL", "https://genai.hkbu.edu.hk/general/rest")
+HKBU_MODEL_NAME = os.getenv("HKBU_MODEL_NAME", "gpt-4-o-mini")
+HKBU_API_VERSION = os.getenv("HKBU_API_VERSION", "2024-05-01-preview")
+
+# 数据库配置
 DB_HOST = os.getenv("DB_HOST")
 DB_NAME = os.getenv("DB_NAME")
 DB_USER = os.getenv("DB_USER")
@@ -31,13 +38,6 @@ DB_PORT = os.getenv("DB_PORT")
 
 # 记录机器人启动时间（用于 /stats 命令）
 BOT_START_TIME = datetime.datetime.now(datetime.timezone.utc)
-
-# 初始化 OpenAI 客户端
-try:
-    openai_client = OpenAI(api_key=OPENAI_API_KEY)
-except Exception as e:
-    logger.error(f"无法初始化 OpenAI 客户端: {e}")
-    openai_client = None
 
 # --- 数据库操作 ---
 
@@ -49,7 +49,8 @@ def get_db_connection():
             dbname=DB_NAME,
             user=DB_USER,
             password=DB_PASSWORD,
-            port=DB_PORT
+            port=DB_PORT,
+            sslmode="require"  # AWS RDS 云数据库需要 SSL
         )
         return conn
     except psycopg2.OperationalError as e:
@@ -65,7 +66,6 @@ def log_to_db(user_id: int, user_message: str, bot_response: str):
 
     try:
         with conn.cursor() as cur:
-            # SQL 查询语句
             query = sql.SQL("INSERT INTO chat_logs (user_id, user_message, bot_response) VALUES (%s, %s, %s)")
             cur.execute(query, (user_id, user_message, bot_response))
         conn.commit()
@@ -75,7 +75,7 @@ def log_to_db(user_id: int, user_message: str, bot_response: str):
     finally:
         conn.close()
 
-# --- OpenAI 交互 ---
+# --- HKBU GenAI API 交互 ---
 
 # 系统提示词：让 GPT 扮演 HKBU 校园助手角色
 SYSTEM_PROMPT = (
@@ -86,22 +86,43 @@ SYSTEM_PROMPT = (
 )
 
 def get_llm_response(prompt: str) -> str:
-    """调用 OpenAI API 获取回复"""
-    if not openai_client:
-        logger.error("OpenAI 客户端未初始化，无法获取回复。")
+    """调用 HKBU GenAI API 获取回复"""
+    if not HKBU_API_KEY:
+        logger.error("HKBU_API_KEY 未设置，无法获取回复。")
         return "抱歉，我的大脑（AI模型）暂时无法连接，请稍后再试。"
 
     try:
-        response = openai_client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
+        # 构建 HKBU GenAI API 请求 URL
+        url = f"{HKBU_BASE_URL}/deployments/{HKBU_MODEL_NAME}/chat/completions?api-version={HKBU_API_VERSION}"
+
+        headers = {
+            "Content-Type": "application/json",
+            "api-key": HKBU_API_KEY
+        }
+
+        payload = {
+            "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": prompt}
             ]
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        logger.error(f"调用 OpenAI API 时出错: {e}")
+        }
+
+        response = requests.post(url, json=payload, headers=headers, timeout=30)
+        response.raise_for_status()
+
+        data = response.json()
+
+        if "choices" in data and len(data["choices"]) > 0:
+            return data["choices"][0]["message"]["content"].strip()
+        else:
+            logger.error(f"HKBU API 返回了意外的响应格式: {data}")
+            return "抱歉，AI 返回了意外的响应格式，请稍后再试。"
+
+    except requests.exceptions.Timeout:
+        logger.error("调用 HKBU GenAI API 超时")
+        return "抱歉，AI 响应超时，请稍后再试。"
+    except requests.exceptions.RequestException as e:
+        logger.error(f"调用 HKBU GenAI API 时出错: {e}")
         return "抱歉，我在思考时遇到了一个问题，请稍后再试。"
 
 # --- Telegram 机器人处理器 ---
@@ -229,7 +250,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_message = update.message.text
     logger.info(f"收到来自用户 {user_id} 的消息: {user_message}")
 
-    # 1. 获取 OpenAI 的回复
+    # 1. 获取 HKBU GenAI 的回复
     bot_response = get_llm_response(user_message)
 
     # 2. 将回复发送给用户
