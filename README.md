@@ -4,7 +4,7 @@ A smart campus chatbot built with Telegram, OpenAI GPT-3.5-turbo, and PostgreSQL
 
 ## Features
 
-- AI-powered conversation using OpenAI GPT-3.5-turbo
+- AI-powered conversation using hkbu genai
 - Chat log persistence with PostgreSQL
 - Chat history retrieval, bot statistics, and record clearing via bot commands
 - One-command deployment with Docker Compose
